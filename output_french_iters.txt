@@ -1,0 +1,364 @@
+
+from pathlib import Path
+import copy
+import json
+import math
+import random
+import time
+import traceback
+
+import numpy as np
+import pandas as pd
+
+if "BOOSTER_SEARCH_SPACE" not in globals() or "log_current_booster_run" not in globals():
+    raise ValueError("Run the Booster search prep cell first.")
+if "EXPERIMENT_CONFIG" not in globals():
+    raise ValueError("Run the Experiment parameters cell first.")
+if "train_en_model" not in globals() or "fit_idx" not in globals() or "test_idx" not in globals():
+    raise ValueError("Run the Train-Test split and booster baseline cells first.")
+
+ARTIFACTS_DIR = Path(
+    globals().get("ARTIFACTS_DIR", Path(globals().get("PROJECT_ROOT", Path("."))) / "artifacts")
+).resolve()
+ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+SWEEP_TRIALS_PATH = ARTIFACTS_DIR / "booster_sweep_trials.csv"
+
+DEFAULT_NOTEBOOK_PATH = Path(
+    globals().get("SWEEP_NOTEBOOK_PATH", Path(globals().get("PROJECT_ROOT", Path("."))) / "script_fr.ipynb")
+).resolve()
+
+SWEEP_SETTINGS = {
+    "n_trials": 80,
+    "run_prefix": "sweep",
+    "random_seed": 42,
+    "include_current_config": True,
+    "sample_without_replacement": True,
+    "stop_on_error": False,
+    "apply_best_config_at_end": False,
+    "plot_top_n": 20,
+    "notebook_path": str(DEFAULT_NOTEBOOK_PATH),
+}
+
+print("Sweep runner ready. Edit SWEEP_SETTINGS, then call `run_booster_sweep()`.")
+print(f"- trials file: {SWEEP_TRIALS_PATH}")
+print(f"- notebook path: {SWEEP_SETTINGS['notebook_path']}")
+
+
+def _space_size(space):
+    return int(math.prod(len(values) for values in space.values()))
+
+
+def _config_signature(cfg):
+    return json.dumps(cfg, sort_keys=True)
+
+
+def _draw_random_override(space, rng):
+    out = {}
+    for key, values in space.items():
+        out[key] = copy.deepcopy(values[rng.randrange(len(values))])
+    return out
+
+
+def _extract_space_override(config, space):
+    out = {}
+    for key in space.keys():
+        if key in config:
+            out[key] = copy.deepcopy(config[key])
+    return out
+
+
+def _candidate_notebook_paths(nb_path=None):
+    candidates = []
+
+    if nb_path:
+        candidates.append(Path(nb_path))
+
+    sweep_global = globals().get("SWEEP_NOTEBOOK_PATH")
+    if sweep_global:
+        candidates.append(Path(sweep_global))
+
+    project_root = Path(globals().get("PROJECT_ROOT", Path(".")))
+    candidates.append(project_root / "script_fr.ipynb")
+    candidates.append(Path("script_fr.ipynb"))
+
+    out = []
+    seen = set()
+    for p in candidates:
+        try:
+            rp = p.expanduser().resolve()
+        except Exception:
+            continue
+        key = str(rp)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rp)
+    return out
+
+
+def _load_booster_cell_source_from_notebook(nb_path=None):
+    checked = []
+
+    for candidate in _candidate_notebook_paths(nb_path=nb_path):
+        checked.append(str(candidate))
+        if not candidate.exists():
+            continue
+
+        try:
+            nb = json.loads(candidate.read_text())
+        except Exception:
+            continue
+
+        cells = nb.get("cells", [])
+        for idx, cell in enumerate(cells):
+            if cell.get("cell_type") != "markdown":
+                continue
+            md = "".join(cell.get("source", []))
+            if "## Strongest booster (account-level second stage)" in md:
+                if idx + 1 >= len(cells):
+                    break
+                code_cell = cells[idx + 1]
+                if code_cell.get("cell_type") != "code":
+                    break
+                print(f"Loaded booster source from: {candidate}")
+                return "".join(code_cell.get("source", []))
+
+    raise FileNotFoundError(
+        "Could not locate notebook file containing the booster cell. "
+        "Set SWEEP_SETTINGS['notebook_path'] to your .ipynb path. "
+        f"Checked: {checked}"
+    )
+
+
+def _build_trial_queue(base_config, space, n_trials, include_current, sample_without_replacement, rng):
+    queue = []
+    seen = set()
+
+    if include_current:
+        current_override = _extract_space_override(base_config, space)
+        sig = _config_signature(current_override)
+        seen.add(sig)
+        queue.append(current_override)
+
+    max_unique = _space_size(space)
+    target = int(n_trials)
+    if include_current and target > 0:
+        target -= 1
+
+    if sample_without_replacement:
+        target = min(target, max_unique - len(seen))
+
+    attempts = 0
+    max_attempts = max(1000, target * 80)
+
+    while len(queue) < (target + (1 if include_current else 0)):
+        cand = _draw_random_override(space, rng)
+        sig = _config_signature(cand)
+
+        if sample_without_replacement and sig in seen:
+            attempts += 1
+            if attempts > max_attempts:
+                break
+            continue
+
+        seen.add(sig)
+        queue.append(cand)
+
+    return queue
+
+
+def _run_one_trial(base_config, override_cfg, run_name, booster_code, stop_on_error=False):
+    trial_config = copy.deepcopy(base_config)
+    trial_config.update(copy.deepcopy(override_cfg))
+    globals()["EXPERIMENT_CONFIG"] = trial_config
+
+    start = time.time()
+    try:
+        exec(booster_code, globals())
+        duration = time.time() - start
+
+        notes_payload = {
+            "duration_sec": round(float(duration), 2),
+            "override": override_cfg,
+        }
+        log_current_booster_run(
+            run_name=run_name,
+            notes=json.dumps(notes_payload, sort_keys=True),
+            verbose=False,
+        )
+
+        return {
+            "run_name": run_name,
+            "status": "ok",
+            "duration_sec": float(duration),
+            "ensemble_score": float(globals().get("test_score_ensemble_en", np.nan)),
+            "booster_score": float(globals().get("second_stage_test_score_en", np.nan)),
+            "score_gain": float(globals().get("second_stage_test_score_en", np.nan))
+            - float(globals().get("test_score_ensemble_en", np.nan)),
+            "seed_std_score": float(globals().get("seed_std_score_en", np.nan)),
+            "selected_profile": str(globals().get("second_stage_selected_profile_en", "")),
+            "selected_alpha": float(globals().get("second_stage_alpha_en", np.nan)),
+            "selected_threshold": float(globals().get("second_stage_selected_threshold_en", np.nan)),
+            "feature_source": str(globals().get("second_stage_fit_feature_source_en", "")),
+            "error": "",
+            "override_json": json.dumps(override_cfg, sort_keys=True),
+        }
+    except Exception as exc:
+        duration = time.time() - start
+        err = f"{type(exc).__name__}: {exc}"
+        tb = traceback.format_exc(limit=4)
+
+        row = {
+            "run_name": run_name,
+            "status": "failed",
+            "duration_sec": float(duration),
+            "ensemble_score": np.nan,
+            "booster_score": np.nan,
+            "score_gain": np.nan,
+            "seed_std_score": np.nan,
+            "selected_profile": "",
+            "selected_alpha": np.nan,
+            "selected_threshold": np.nan,
+            "feature_source": "",
+            "error": f"{err} | {tb}",
+            "override_json": json.dumps(override_cfg, sort_keys=True),
+        }
+
+        if stop_on_error:
+            raise
+        return row
+
+
+def run_booster_sweep(settings=None):
+    cfg = copy.deepcopy(SWEEP_SETTINGS)
+    if settings is not None:
+        cfg.update(settings)
+
+    n_trials = int(cfg.get("n_trials", 50))
+    if n_trials < 1:
+        raise ValueError("n_trials must be >= 1")
+
+    rng = random.Random(int(cfg.get("random_seed", 42)))
+    run_prefix = str(cfg.get("run_prefix", "sweep"))
+    include_current = bool(cfg.get("include_current_config", True))
+    sample_wo_repl = bool(cfg.get("sample_without_replacement", True))
+    stop_on_error = bool(cfg.get("stop_on_error", False))
+    apply_best = bool(cfg.get("apply_best_config_at_end", False))
+    plot_top_n = int(cfg.get("plot_top_n", 20))
+    notebook_path = cfg.get("notebook_path", str(DEFAULT_NOTEBOOK_PATH))
+
+    base_config = copy.deepcopy(EXPERIMENT_CONFIG)
+    booster_code = _load_booster_cell_source_from_notebook(nb_path=notebook_path)
+
+    queue = _build_trial_queue(
+        base_config=base_config,
+        space=BOOSTER_SEARCH_SPACE,
+        n_trials=n_trials,
+        include_current=include_current,
+        sample_without_replacement=sample_wo_repl,
+        rng=rng,
+    )
+
+    if not queue:
+        raise ValueError("No trials were generated. Check search space and settings.")
+
+    print(
+        f"Starting sweep: trials={len(queue)}, include_current={include_current}, "
+        f"without_replacement={sample_wo_repl}, space_size={_space_size(BOOSTER_SEARCH_SPACE):,}"
+    )
+
+    rows = []
+    sweep_start = time.time()
+    for idx, override_cfg in enumerate(queue, start=1):
+        run_name = f"{run_prefix}_{idx:04d}"
+        print(f"\n[{idx}/{len(queue)}] Running {run_name} ...")
+
+        row = _run_one_trial(
+            base_config=base_config,
+            override_cfg=override_cfg,
+            run_name=run_name,
+            booster_code=booster_code,
+            stop_on_error=stop_on_error,
+        )
+        rows.append(row)
+
+        if row["status"] == "ok":
+            print(
+                f"{run_name}: booster={row['booster_score']:.1f}, ensemble={row['ensemble_score']:.1f}, "
+                f"gain={row['score_gain']:.1f}, dur={row['duration_sec']:.1f}s"
+            )
+        else:
+            print(f"{run_name}: FAILED -> {row['error'].split('|')[0]}")
+
+    total_dur = time.time() - sweep_start
+    sweep_df = pd.DataFrame(rows)
+
+    SWEEP_TRIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SWEEP_TRIALS_PATH.exists():
+        old = pd.read_csv(SWEEP_TRIALS_PATH)
+        sweep_df = pd.concat([old, sweep_df], ignore_index=True)
+
+    sweep_df = sweep_df.drop_duplicates(subset=["run_name"], keep="last")
+    sweep_df.to_csv(SWEEP_TRIALS_PATH, index=False)
+
+    globals()["booster_sweep_last_results_en"] = sweep_df.copy()
+
+    # Restore baseline config to avoid accidental side-effects after sweep.
+    globals()["EXPERIMENT_CONFIG"] = base_config
+
+    ok_df = sweep_df[sweep_df["status"] == "ok"].copy()
+    if not ok_df.empty:
+        ok_df = ok_df.sort_values(
+            by=["booster_score", "score_gain", "seed_std_score"],
+            ascending=[False, False, True],
+        )
+
+    print("\nSweep finished.")
+    print(f"- total duration: {total_dur/60.0:.1f} min")
+    print(f"- successful trials: {int((sweep_df['status'] == 'ok').sum())}")
+    print(f"- failed trials: {int((sweep_df['status'] == 'failed').sum())}")
+    print(f"- trials csv: {SWEEP_TRIALS_PATH}")
+
+    if not ok_df.empty:
+        print("\nTop sweep trials:")
+        print(
+            ok_df[
+                [
+                    "run_name",
+                    "ensemble_score",
+                    "booster_score",
+                    "score_gain",
+                    "seed_std_score",
+                    "selected_profile",
+                    "feature_source",
+                    "duration_sec",
+                ]
+            ].head(10).to_string(index=False)
+        )
+
+    if apply_best and SEARCH_BEST_PATH.exists():
+        best_payload = json.loads(SEARCH_BEST_PATH.read_text())
+        best_config = best_payload.get("best_config", {})
+        if best_config:
+            globals()["EXPERIMENT_CONFIG"] = best_config
+            print("\nApplied best config from SEARCH_BEST_PATH into EXPERIMENT_CONFIG.")
+
+    if plot_top_n > 0:
+        try:
+            plot_search_history(top_n=plot_top_n)
+        except Exception as exc:
+            print(f"Could not render history plot: {exc}")
+
+    return sweep_df
+
+
+# Example usage (manual):
+sweep_results = run_booster_sweep({
+    "n_trials": 20,
+    "run_prefix": "week_sweep",
+    "include_current_config": True,
+    "sample_without_replacement": True,
+    "plot_top_n": 25,
+    # Optional in Colab: set this if auto-detection does not find your notebook file.
+    "notebook_path": "/content/drive/MyDrive/bot_or_not_McHacks_2026/script_fr.ipynb",
+ })
